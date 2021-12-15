@@ -1,0 +1,1645 @@
+---
+output:
+  word_document: default
+  html_document: default
+editor_options: 
+  chunk_output_type: console
+---
+hyra---
+title: "IEMS_462-1 Project"
+author: "Neelam Modi, Mark Noll, Meenakshi Kommineni"
+date: "12/03/2021"
+output:
+html_document:
+df_print: paged
+pdf_document: default
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list=ls())
+# setwd("C:/Users/mdnol/Documents/IEMS PhD/Classes/Fall 2021/IEMS 462-1 Predictive Analytics/Data")
+setwd("~/00_Neelam/01_Documents/01_Northwestern/03_Schoolwork/05_Fall-2021/IEMS_462-1")
+library(tidyverse)
+library(nnet)
+library(MASS)
+library(dplyr)
+library(ppcor)
+library(ggplot2)
+library(pROC)
+library(ROCR)
+library(bestglm)
+library(knitr)
+library(magrittr)
+library(pander)
+library(car)
+library(glmnet)
+library(corrplot)
+library(wrapr)
+```
+
+
+## Define functions
+```{r}
+# copy data to clipboard for pasting into Excel
+write.excel <- function (x,row.names=FALSE,col.names=TRUE,...) {
+  write.table (x,"clipboard",sep="\t",row.names=row.names,col.names=col.names,...)
+}
+```
+
+## Import Dataset and Feature Engineering
+```{r 1}
+
+data <- read.csv("Project 1 data.csv", header=TRUE, stringsAsFactors=FALSE)
+
+# ==============================================================================
+# REMOVE ZEROES
+# ==============================================================================
+# count number of rows in the dataset where the customer has no sales or order data
+nonzeroes <- which((data[5]+data[6]+data[7]+data[8]+data[9]+data[10]+data[11]+data[12]+data[13]+data[14]+data[15]+data[16] > 0))
+print(nrow(data) - length(nonzeroes))
+
+# remove all zero rows from dataset
+data <- data[nonzeroes,]
+
+
+# ==============================================================================
+# REMOVE BIG SPENDERS
+# ==============================================================================
+# count number of rows in the dataset where the customer spent $500 or more
+bigspend <- which((data[1] > 300))
+print(nrow(data) - length(bigspend))
+
+# Find 99th percentile of $240, make graph for dropping criteria
+quantile(data$targdol[data$targdol>0], .99)
+plot(data$targdol[data$targdol>0])
+abline(a = 300, b = 0)
+
+bigspend <- which((data[1] > 300))
+print(nrow(data) - length(bigspend))
+
+##MN: Checking normality
+hist(log(1 + (data$targdol[data$targdol<300 & data$targdol >0])))
+
+
+# remove all zero rows from dataset
+data <- data[-(bigspend),]
+
+
+# ==============================================================================
+# ORDER HISTORY
+# ==============================================================================
+# calculate total number of orders per customer by summing LTD fall order history and LTD spring order history
+data$ordhist_new <- data$falord + data$sprord
+
+# check if there are discrepancies between given LTD order history and summed LTD order history
+# 2685 observations for which sum of fall and spring orders is greater than order history
+# do not use ordhist ever again
+data$ordhist_check <- data$ordhist_new - data$ordhist
+
+# Investigate order history differences in more detail - most are pretty small
+sum(abs(data$ordhist_check) > 1e-5)
+mean(abs(data$ordhist_check[data$ordhist_check > 1e-5]))
+
+# ==============================================================================
+# CONSISTENCY: interaction of the indicator variables for the purchases for the last several time periods
+# ==============================================================================
+# Binarize the orders and sales for the past 4 time periods
+data$ordtyr_bin <- ifelse(data$ordtyr > 0, 1, 0)
+data$ordlyr_bin <- ifelse(data$ordlyr > 0, 1, 0)
+data$ord2ago_bin <- ifelse(data$ord2ago > 0, 1, 0)
+data$ord3ago_bin <- ifelse(data$ord3ago > 0, 1, 0)
+data$slstyr_bin <- ifelse(data$slstyr > 0, 1, 0)
+data$slslyr_bin <- ifelse(data$slslyr > 0, 1, 0)
+data$sls2ago_bin <- ifelse(data$sls2ago > 0, 1, 0)
+data$sls3ago_bin <- ifelse(data$sls3ago > 0, 1, 0)
+
+# Order consistency
+data$ordconsistency <- data$ordtyr_bin + data$ordlyr_bin + data$ord2ago_bin + data$ord3ago_bin
+hist(data$ordconsistency)
+
+# Sales consistency
+data$slsconsistency <- data$slstyr_bin + data$slslyr_bin + data$sls2ago_bin + data$sls3ago_bin
+hist(data$slsconsistency)
+
+# Check if there are inconsistencies between sales vs. order data by year
+# Drop data with these conflicts - drop 645 obs out of 100,000
+
+# Record lengths prior to dropping 
+predrop_obs_targol_subset <- length(data$targdol[data$targdol>0])
+predrop_obs <- length(data$targdol)
+
+
+data$slsordtyr_check <- data$slstyr_bin - data$ordtyr_bin
+sum(abs(data$slsordtyr_check))
+sum((data$slsordtyr_check != 0 & data$targdol > 0))
+tyrdrop <- which(abs(data$slsordtyr_check) > 0)
+length(tyrdrop)
+data <- data[-tyrdrop,]
+
+data$slsordlyr_check <- data$slslyr_bin - data$ordlyr_bin
+sum(abs(data$slsordlyr_check))
+sum((data$slsordlyr_check != 0 & data$targdol > 0))
+lyrdrop <- which(abs(data$slsordlyr_check) > 0)
+length(lyrdrop)
+data <- data[-lyrdrop,]
+
+data$slsord2ago_check <- data$sls2ago_bin - data$ord2ago_bin
+sum(abs(data$slsord2ago_check))
+sum((data$slsord2ago_check != 0 & data$targdol > 0))
+twoagodrop <- which(abs(data$slsord2ago_check) > 0)
+length(twoagodrop)
+data <- data[-twoagodrop,]
+
+data$slsord3ago_check <- data$sls3ago_bin - data$ord3ago_bin
+sum(abs(data$slsord3ago_check))
+sum((data$slsord3ago_check != 0 & data$targdol > 0))
+threeagodrop <- which(abs(data$slsord3ago_check) > 0)
+length(threeagodrop)
+data <- data[-threeagodrop,]
+
+#Quantify number of obs dropped
+print(predrop_obs - length(data$targdol))
+print(predrop_obs_targol_subset - length(data$targdol[data$targdol>0]))
+
+# ==============================================================================
+# SALES / ORDER per year and LTD
+# ==============================================================================
+# calculate sales per order
+data$slsordtyr <- data$slstyr / data$ordtyr
+data$slsordlyr <- data$slslyr / data$ordlyr
+data$slsord2ago <- data$sls2ago / data$ord2ago
+data$slsord3ago <- data$sls3ago / data$ord3ago
+data$slsordhist <- data$slshist / data$ordhist_new
+
+# impute NaN values with 0
+data$slsordtyr[is.na(data$slsordtyr)] <- 0
+data$slsordlyr[is.na(data$slsordlyr)] <- 0
+data$slsord2ago[is.na(data$slsord2ago)] <- 0
+data$slsord3ago[is.na(data$slsord3ago)] <- 0
+data$slsordhist[is.na(data$slsordhist)] <- 0
+data$slsordhist[is.infinite(data$slsordhist)] <- 0
+
+# ==============================================================================
+# SALES HISTORY & SALES / YEAR
+# ==============================================================================
+data$slshist4yr <- data$slstyr + data$slslyr + data$sls2ago + data$sls3ago
+data$slshist3yr <- data$slstyr + data$slslyr + data$sls2ago
+data$slshist2yr <- data$slstyr + data$slslyr
+
+data$slshist4yr_avg <- data$slshist4yr / 4
+data$slshist3yr_avg <- data$slshist3yr / 3
+data$slshist2yr_avg <- data$slshist2yr / 2 #MN: Corrected 12-1
+ 
+# ==============================================================================
+# ORDER HISTORY & ORDERS / YEAR
+# ==============================================================================
+data$ordhist4yr <- data$ordtyr + data$ordlyr + data$ord2ago + data$ord3ago
+data$ordhist3yr <- data$ordtyr + data$ordlyr + data$ord2ago
+data$ordhist2yr <- data$ordtyr + data$ordlyr
+
+data$ordhist4yr_avg <- data$ordhist4yr / 4
+data$ordhist3yr_avg <- data$ordhist3yr / 3 #MN: Corrected 12-1
+data$ordhist2yr_avg <- data$ordhist2yr / 2
+
+# ==============================================================================
+# SHARE OF FALL ORDERS
+# ==============================================================================
+# continuous variable from 0 to 1, over all historical orders
+data$falordshare <- data$falord / (data$falord + data$sprord)
+data$falordshare[is.na(data$falordshare)] <- 0
+
+# ==============================================================================
+# LOG TRANSFORM RESPONSE VARIABLE
+# ==============================================================================
+# Data viz
+# make a histogram of targdol for customers with targdol > 0
+hist(data$targdol[which(data$targdol > 0)], breaks = 100)
+# make a histogram of the log - much better distributed
+hist(log(data$targdol[which(data$targdol > 0)] + 1), breaks = 50)
+
+# Make new variables
+# log transform the purchase amount y to y <- ln(y+1)
+data$targdol_log <- log(data$targdol + 1)
+# make binary for logistic regression
+data$targdol_bin <- ifelse(data$targdol_log > 0, 1, 0)
+
+# ==============================================================================
+# LOG TRANSFORM PREDICTOR VARIABLEs
+# ==============================================================================
+data$slstyr_log <- log(data$slstyr + 1)
+data$slslyr_log <- log(data$slslyr + 1)
+data$sls2ago_log <- log(data$sls2ago + 1)
+data$sls3ago_log <- log(data$sls3ago + 1)
+data$slshist_log <- log(data$slshist + 1)
+data$slshist4yr_log <- log(data$slshist4yr + 1)
+data$slshist3yr_log <- log(data$slshist3yr + 1)
+data$slshist2yr_log <- log(data$slshist2yr + 1)
+
+
+# ==============================================================================
+# DATES - INVESTIGATE datelp6, lpuryear, and relationship with slstyr and slslyr
+# ==============================================================================
+
+# TAKEAWAYS
+# datelp6 is not up date to compared to to slstyr, so do not rely on it
+# datead6 seems to be a reliable variable
+# calendar is on a Sept-Aug calendar, with slstyr corresponding to Sept 2011 - Aug 2012
+
+# clean date information
+data$datead6 <- as.Date(data$datead6, format="%m/%d/%Y")
+data$datelp6 <- as.Date(data$datelp6, format="%m/%d/%Y")
+
+# extract year and month from datelp6 column and use instead of lpuryear
+# do not use the column "lpuryear" ever again
+data$lpuryear_calendar <- as.numeric(format(data$datelp6,"%Y"))
+data$lpurmonth <- as.numeric(format(data$datelp6,"%m"))
+# plot frequency of different datelp6 variable - see bunching 
+hist(data$datelp6[which(data$targdol > 0)], breaks = 100)
+
+# calculate difference in dates between datead6 and datelp6 columns to understand how long each customer has been in the system
+# note that ~800 observations have a date added sooner than the last purchased date
+data$duration <- as.numeric(difftime(data$datelp6, data$datead6, units="days"))
+sum(data$duration < 0)
+sum(data$duration < 0 & data$targdol > 0)
+
+# Make lpuryear_offset - lpuryear_calendar offset by 3 months, to be consistent with internal reporting that defines year from Sept-Aug
+# But do not use lpuryear_offset do not use in modeling, because data are stale
+# show evidence for this further below 
+data$lpuryear_offset <- as.numeric(ifelse(data$lpurmonth < 9 & data$lpuryear_calendar >= 2008, data$lpuryear_calendar, ifelse(data$lpurmonth >= 9 & data$lpuryear_calendar >= 2008, data$lpuryear_calendar + 1, data$lpuryear_calendar)))
+
+# Make year_alt - a check on slstyr and lpuryear_calendar / lpuryear_vs 
+data$year_alt <- as.numeric(
+  ifelse(data$slstyr>0 & data$lpuryear_calendar == 2011 & data$lpurmonth >= 9 ,
+    2012,
+  ifelse(data$slslyr>0  & data$lpuryear_calendar == 2010 & data$lpurmonth >= 9,
+    2011,
+  ifelse(data$sls2ago>0  & data$lpuryear_calendar == 2009 & data$lpurmonth >= 9,
+    2010,
+  ifelse(data$sls3ago>0  & data$lpuryear_calendar == 2008 & data$lpurmonth >= 9,
+    2009,
+    data$lpuryear_calendar)))))
+
+
+  
+# quantify differences - 175, vast majority are in fall of 2008 that got classified as 2 years ago when they should actually be classified as 3 years ago. 
+# do not drop herebecause we do not use any form of datelp6 in our modeling
+data$year_diff = data$year_alt - as.numeric(data$lpuryear_offset)
+sum(data$year_alt != data$lpuryear_offset)
+
+# classify by month and year most are in fall 2008
+table(data$lpuryear_calendar, data$year_diff)
+table(data$lpurmonth, data$year_diff)
+
+# look at specific data - commented out here 
+# view(data[(data$year_alt != data$lpuryear_offset),])
+
+
+## Investigate slstyr !=0 but lpuryear_offset earlier and qantify frequency
+## Takeaway: 
+
+## only for targdol != 0, to account for updates due to datelp6 being updated - conservative measure of how much distortion there is 
+## this year
+data$flag_slstyr = data$slstyr_bin == 1 & data$lpuryear_offset != 2012 & data$targdol == 0
+sum(data$flag_slstyr)
+# view(data[data$flag_slstyr,])
+
+## last year
+data$flag_slslyr = data$slslyr_bin == 1 & data$lpuryear_offset != 2011 & data$targdol == 0 & data$slstyr_bin == 0
+sum(data$flag_slslyr)
+# view(data[data$flag_slslyr,])
+
+## 2 years ago
+data$flag_sls2ago = data$sls2ago_bin == 1 & data$lpuryear_offset != 2010 & data$targdol == 0 & data$slstyr_bin == 0 &  data$slslyr_bin == 0
+sum(data$flag_sls2ago)
+
+## 3 years ago
+data$flag_sls3ago = data$sls3ago_bin == 1 & data$lpuryear_offset != 2009 & data$targdol == 0 & data$slstyr_bin == 0 & data$slslyr_bin == 0 & data$sls2ago_bin == 0
+sum(data$flag_sls3ago)
+
+## any flag
+data$flag_date_any = ifelse(data$flag_slstyr + data$flag_slslyr + data$flag_sls2ago + data$flag_sls3ago > 0, 1, 0)
+
+## quantify discrepancies - 3,700 obs, almost 4% of data
+## figure is only for non-purchasers - value is even higher for when include targdol > 0 customers  
+sum(data$flag_date_any)
+sum(data$flag_date_any) / length(data$flag_date_any)
+#view(data[data$flag_date_any==1,])
+#write.excel(data[data$flag_date_any==1,])
+
+```
+
+
+## All Predictor Variables
+``` {r 2}
+## view the index of names
+names <- data.frame(names(data))
+
+# Create cleaned data frame with all predictors
+data_clean <- data.frame(cbind(
+  # response
+  as.numeric(data$targdol),  # log transformed response
+  as.numeric(data$targdol_log),  # log transformed response
+  as.numeric(data$targdol_bin),  # log transformed response
+  
+  # # dates - DO NOT USE except possible for datead6
+  # data$datead6,  # date of last purchase
+  # data$datelp6,  # date of last purchase
+  # data$lpuryear_calendar,  # year of last purchase - calendar year
+  # data$lpuryear_offset,  # year of last purchase - offset calendar to match Sept-Aug year
+  
+  # sales
+  # as.numeric(data$slstyr),  # sales quantity this year
+  # as.numeric(data$slslyr),  # sales quantity last year
+  # as.numeric(data$sls2ago),  # sales quantity 2 years ago
+  # as.numeric(data$sls3ago),  # sales quantity 3 years ago
+  # as.numeric(data$slshist),  # LTD sales history
+  as.numeric(data$slsconsistency),  # sales consistency
+  # as.numeric(data$slshist4yr),  # 4-year sales quantity
+  # as.numeric(data$slshist3yr),  # 3-year sales quantity
+  # as.numeric(data$slshist2yr),  # 2-year sales quantity
+  as.numeric(data$slshist4yr_avg),  # 4-year avg sales quantity per year
+  as.numeric(data$slshist3yr_avg),  # 3-year avg sales quantity per year
+  as.numeric(data$slshist2yr_avg),  # 2-year avg sales quantity per year
+  
+  # log of sales
+  as.numeric(data$slstyr_log),  # sales quantity this year
+  as.numeric(data$slslyr_log),  # sales quantity last year
+  as.numeric(data$sls2ago_log),  # sales quantity 2 years ago
+  as.numeric(data$sls3ago_log),  # sales quantity 3 years ago
+  as.numeric(data$slshist_log),  # LTD sales history
+  as.numeric(data$slshist4yr_log),  # 4-year sales quantity
+  as.numeric(data$slshist3yr_log),  # 3-year sales quantity
+  as.numeric(data$slshist2yr_log),  # 2-year sales quantity
+  
+  # sales indicators/binaries
+  as.numeric(data$slstyr_bin),
+  as.numeric(data$slslyr_bin),
+  as.numeric(data$sls2ago_bin),
+  as.numeric(data$sls3ago_bin),
+  
+  # orders
+  as.numeric(data$ordtyr), # order quantity this year
+  as.numeric(data$ordlyr), # order quantity last year
+  as.numeric(data$ord2ago), # order quantity 2 years ago
+  as.numeric(data$ord3ago), # order quantity 3 years ago
+  as.numeric(data$ordhist_new), # LTD order quantity
+  as.numeric(data$falord),  # LTD fall order quantityplot
+  as.numeric(data$sprord),  # LTD spring order quantity
+  as.numeric(data$falordshare),  # LTD spring order quantity
+  as.numeric(data$ordconsistency),  # order consistency
+  as.numeric(data$ordhist4yr),  # 4-year order quantity
+  as.numeric(data$ordhist3yr),  # 3-year order quantity
+  as.numeric(data$ordhist2yr),  # 2-year order quantity
+  as.numeric(data$ordhist4yr_avg),  # 4-year avg order quantity per year
+  as.numeric(data$ordhist3yr_avg),  # 3-year avg order quantity per year
+  as.numeric(data$ordhist2yr_avg),  # 2-year avg order quantity per year
+  
+  # order indicators/binaries
+  as.numeric(data$ordtyr_bin),
+  as.numeric(data$ordlyr_bin),
+  as.numeric(data$ord2ago_bin),
+  as.numeric(data$ord3ago_bin),
+
+  # sales/order
+  as.numeric(data$slsordhist),  # LTD sales/order
+  as.numeric(data$slsordtyr),  # sales/order this year
+  as.numeric(data$slsordlyr),  # sales/order last year
+  as.numeric(data$slsord2ago),  # sales/order 2 years ago
+  as.numeric(data$slsord3ago),  # sales/order 3 years ago
+
+  # training set indicator
+  as.numeric(data$train)
+  ))
+
+colnames(data_clean) <- c(
+  # response
+  "targdol",  # response variable, dollars sold
+  "targdol_log",  # response variable, log of dollars sold
+  "targdol_bin",  # response variable, indicator of dollars sold
+  
+  # # dates - NOT RELIABLE, DO NOT USE
+  # "datead6",  # date of last purchase
+  # "datelp6",  # date of last purchase
+  # "lpuryear_calendar",  # year of last purchase
+  # "lpuryear_offset",  # year of last purchase
+
+  # sales
+  # "slstyr",  # sales quantity this year
+  # "slslyr",  # sales quantity last year
+  # "sls2ago",  # sales quantity 2 years ago
+  # "sls3ago",  # sales quantity 3 years ago
+  # "slshist",  # LTD sales history
+  "slsconsistency",  # sales consistency
+  # "slshist4yr",  # 4-year sales quantity
+  # "slshist3yr",  # 3-year sales quantity
+  # "slshist2yr",  # 2-year sales quantity
+  "slshist4yr_avg",  # 4-year avg sales quantity per year
+  "slshist3yr_avg",  # 3-year avg sales quantity per year
+  "slshist2yr_avg",  # 2-year avg sales quantity per year
+  
+  # log of sales
+  "slstyr_log",  # sales quantity this year
+  "slslyr_log",  # sales quantity last year
+  "sls2ago_log",  # sales quantity 2 years ago
+  "sls3ago_log",  # sales quantity 3 years ago
+  "slshist_log",  # LTD sales history
+  "slshist4yr_log",  # 4-year sales quantity
+  "slshist3yr_log",  # 3-year sales quantity
+  "slshist2yr_log",  # 2-year sales quantity
+
+  #sales indicators/binaries
+  "slstyr_bin",
+  "slslyr_bin",
+  "sls2ago_bin",
+  "sls3ago_bin",
+
+  # orders
+  "ordtyr", # order quantity this year
+  "ordlyr", # order quantity last year
+  "ord2ago", # order quantity 2 years ago
+  "ord3ago", # order quantity 3 years ago
+  "ordhist_new", # LTD order quantity
+  "falord",  # LTD fall order quantity
+  "sprord",  # LTD spring order quantity
+  "falordshare",  # fall order share
+  "ordconsistency",  # order consistency
+  "ordhist4yr",  # 4-year order quantity
+  "ordhist3yr",  # 3-year order quantity
+  "ordhist2yr",  # 2-year order quantity
+  "ordhist4yr_avg",  # 4-year avg order quantity per year
+  "ordhist3yr_avg",  # 3-year avg order quantity per year
+  "ordhist2yr_avg",  # 2-year avg order quantity per year
+  
+  #order indicators
+  "ordtyr_bin",
+  "ordlyr_bin",
+  "ord2ago_bin",
+  "ord3ago_bin",
+
+  # sales/order
+  "slsordhist",  # LTD sales/order
+  "slsordtyr",  # sales/order this year
+  "slsordlyr",  # sales/order last year
+  "slsord2ago",  # sales/order 2 years ago
+  "slsord3ago",  # sales/order 3 years ago
+
+  # training set indicator
+  "train"
+  )
+
+head(data_clean)
+summary(data_clean)
+
+```
+
+
+## Dataset Creation
+``` {r 3}
+
+# ==============================================================================
+# TRAINING/TEST SET
+# ==============================================================================
+# divide the data into training and test sets
+data_train <- data_clean[(data_clean$train == 1),]
+data_test <- data_clean[(data_clean$train == 0),]
+
+# check to make sure all data is accounted for
+sum(nrow(data_train),nrow(data_test))
+
+# ==============================================================================
+# MULTIPLE LINEAR REGRESSION - OVERSAMPLING POSITIVE RESPONSES
+# ==============================================================================
+
+# make multiple regression datasets - conditioned on targdol > 0 
+mr_train <- data_train[data_train$targdol > 0,]
+mr_train <- subset(mr_train, select=-c(targdol, targdol_bin, train, ordtyr_bin, ordlyr_bin, ord2ago_bin, ord3ago_bin, ordconsistency))
+
+mr_test <- data_test[data_test$targdol > 0,]
+mr_test <- subset(mr_test, select=-c(targdol, targdol_bin, train, ordtyr_bin, ordlyr_bin, ord2ago_bin, ord3ago_bin, ordconsistency))
+
+# ==============================================================================
+# LOGISTIC REGRESSION - OVERSAMPLING POSITIVE RESPONSES
+# ==============================================================================
+# check how many positive responses are in the training dataset to see if oversampling is needed
+table(data_train$targdol_bin)
+sum(data_train$targdol_bin)/length(data_train$targdol_bin)
+
+# extract positive responses
+targdol_bin_pos <- data_train[data_train$targdol_bin==1,]
+
+# define the factor by which we want to oversample
+# Mark comment: does not run due to "temp" variable
+m=4
+lr_train_OS <- rbind(data_train, targdol_bin_pos[rep(1:nrow(targdol_bin_pos),(m-1)),])  # must use m-1 here because this tells it how many duplicated rows to add in addition to the row that already exists
+table(lr_train_OS$targdol_bin)
+# use train_OS for fitting the logistic regression model, but not for linear regression
+lr_test <- data_test
+
+```
+
+## Data Visualizations
+``` {r}
+
+#for (i in 5:16){
+#  graphdata = data[data$train==1]
+#  i = 12
+#  var <- print(names[i])
+#  hist(data[,i])
+#  plot(data$targdol[data$targdol>0],data[data$targdol>0,i],ylab = "Targdol", main = paste("Targdol", " vs ", var), xlab = paste(var))
+#  plot(log(data$targdol + 1),data[,i],ylab = "Targdol", main = paste("Targdol", " vs log of", var), xlab = paste(var))
+# }
+
+
+hist(data$slsordtyr)
+boxplot(data$slsordtyr)
+#p <- ggplot(data, aes(x=train, y=slsordtyr)) + 
+#  geom_boxplot()
+#p
+
+```
+
+
+## Logistic Regression Functions
+``` {r 4}
+dropHighPValues <- function(model_fit, d, p_threshold=0.05){
+  p_values = summary(model_fit)$coefficients[,4]
+  highest_p_value = max(p_values)
+  updated_model_fit = model_fit
+  
+  while (highest_p_value > p_threshold) {
+    dropped_predictor = names(p_values[p_values==highest_p_value])
+    formul = as.formula(paste('. ~ . - ',dropped_predictor))
+    updated_model_fit = update(updated_model_fit, formul) 
+    p_values = summary(updated_model_fit)$coefficients[,4]
+    highest_p_value = max(p_values)
+  }
+  
+  return(updated_model_fit)
+}
+
+getAuc <- function(observed, predicted){
+  ROC_auc <- performance(prediction(predicted,observed),"auc")
+  auc_value <- ROC_auc@y.values[[1]]
+  return(auc_value)
+}
+
+applyStep <- function(d){
+  print("--GLM--")
+  fit_glm = glm(respondent ~ ., family="binomial", data = d)
+  print(summary(fit_glm))
+  
+  print("--Vif--")
+  print(vif(fit_glm))
+  
+  #backward stepwise
+  print("--Stepwise regression--")
+  fit_step = step(fit_glm)
+  print(summary(fit_step))
+  
+  #drop highest p_values
+  print("--removing non-significant--")
+  fit_dropped = dropHighPValues(fit_step, d)
+  print(summary(fit_dropped))
+  
+  print("--AUC--")
+  auc_value = getAuc(d$respondent, fit_glm$fitted.values)
+  print(auc_value)
+  return(fit_dropped)
+}
+
+bestSubset <- function(d){
+  fit_all = regsubsets(respondent ~ ., data = d, nbest=2)
+  cp_values = summary(fit_all)$cp
+  best_one = which(cp_values==min(cp_values))
+  temp_names = names(coef(fit_all, best_one))
+
+  formul = as.formula(paste('respondent~', paste(temp_names[-1], collapse=' + ')))
+  best_subset_fit = glm(formul, family="binomial", data = d)
+  return(best_subset_fit)
+}
+
+# Exclude targdol, targdol_log, and train columns
+lr_train_OS2 <- subset(lr_train_OS, select=-c(targdol, targdol_log, train))
+
+# Check for collinearity among the predictor variables
+corrplot(cor(lr_train_OS2), method="square")
+
+# OPTION 1: Exclude predictors based on collinearity problem - excluding orders instead of sales
+lr_train_OS3 <- subset(lr_train_OS2, select=-c(
+  # ordhist_new,
+  sprord,
+  slshist4yr_log, slshist3yr_log, slshist2yr_log,
+  slshist4yr_avg, slshist3yr_avg, slshist2yr_avg,
+  slstyr_bin, slslyr_bin, sls2ago_bin, sls3ago_bin,
+  # slstyr_log, slslyr_log, sls2ago_log, sls3ago_log,
+  ordtyr, ordlyr, ord2ago, ord3ago,
+  ordtyr_bin, ordlyr_bin, ord2ago_bin, ord3ago_bin,
+  ordconsistency,
+  ordhist4yr, ordhist3yr, ordhist2yr,
+  ordhist4yr_avg, ordhist3yr_avg, ordhist2yr_avg
+  ))
+
+# OPTION 2: Exclude predictors based on collinearity problem - excluding sales instead of orders
+lr_train_OS4 <- subset(lr_train_OS2, select=-c(
+  ordhist_new,
+  # sprord,
+  ordhist4yr, 
+  ordhist3yr, 
+  ordhist2yr,
+  ordhist4yr_avg, ordhist3yr_avg, ordhist2yr_avg, 
+  ordtyr_bin, ordlyr_bin, ord2ago_bin, ord3ago_bin,
+  # ordtyr, ordlyr, ord2ago, ord3ago,
+  slstyr_log, slslyr_log, sls2ago_log, sls3ago_log, 
+  slstyr_bin, slslyr_bin, sls2ago_bin, sls3ago_bin,
+  slsconsistency, 
+  slshist4yr_log, slshist3yr_log, slshist2yr_log, 
+  slshist4yr_avg, slshist3yr_avg, slshist2yr_avg
+  ))
+
+# OPTION 3: 
+lr_train_OS5 <- subset(lr_train_OS2, select=-c(
+  sprord,
+  ordhist4yr,
+  ordhist3yr,
+  ordhist2yr,
+  ordhist4yr_avg,
+  ordhist3yr_avg, ordhist2yr_avg, 
+  ordtyr_bin, ordlyr_bin, ord2ago_bin, ord3ago_bin,
+  # ordtyr, ordlyr, ord2ago, ord3ago,
+  # slstyr_log, slslyr_log, sls2ago_log, sls3ago_log, 
+  slstyr_bin, slslyr_bin, sls2ago_bin, sls3ago_bin,
+  slsconsistency, 
+  # slshist4yr_log, slshist3yr_log, slshist2yr_log, 
+  # slshist4yr_avg, 
+  slshist3yr_avg, slshist2yr_avg
+  ))
+
+
+# Check for collinearity among the predictor variables again
+par(mfrow=c(1,2))
+corrplot(cor(lr_train_OS3), method="square")
+corrplot(cor(lr_train_OS4), method="square")
+
+# Define targdol_bin as the respondent column
+names(lr_train_OS3)[names(lr_train_OS3)=='targdol_bin'] <- 'respondent'
+observed = lr_train_OS3$respondent
+names(lr_train_OS4)[names(lr_train_OS4)=='targdol_bin'] <- 'respondent'
+observed = lr_train_OS4$respondent
+names(lr_train_OS5)[names(lr_train_OS5)=='targdol_bin'] <- 'respondent'
+observed = lr_train_OS4$respondent
+
+
+# ==============================================================================
+# STEPWISE REGRESSION
+# ==============================================================================
+# LR Model 1
+lr_stepwise1 <- applyStep(lr_train_OS3)
+vif(lr_stepwise1)
+
+# LR Model 2
+lr_stepwise2 <- applyStep(lr_train_OS4)
+vif(lr_stepwise2)
+
+# LR Model 3
+lr_stepwise3 <- applyStep(lr_train_OS5)
+vif(lr_stepwise3)
+
+# ==============================================================================
+# BEST SUBSET REGRESSION
+# ==============================================================================
+# LR Model 3
+lr_bestsubset1=leaps(lr_train_OS3[,c(2:15)],observed,method='Cp',nbest=2,names=names(lr_train_OS3)[2:15])
+df=data.frame(size=lr_bestsubset1$size,Cp=lr_bestsubset1$Cp, lr_bestsubset1$which)
+df
+lr_bestsubset1 = bestSubset(lr_train_OS3)
+summary(lr_bestsubset1) 
+print("Drop high p-values")
+lr_bestsubset1 = dropHighPValues(lr_bestsubset1, lr_train_OS3)
+summary(lr_bestsubset1) 
+getAuc(observed, lr_bestsubset1$fitted.values)
+vif(lr_bestsubset1)
+
+# LR Model 4
+lr_bestsubset2=leaps(lr_train_OS4[,c(2:15)],observed,method='Cp',nbest=2,names=names(lr_train_OS4)[2:15])
+df=data.frame(size=lr_bestsubset2$size,Cp=lr_bestsubset2$Cp, lr_bestsubset2$which)
+df
+lr_bestsubset2 = bestSubset(lr_train_OS4)
+summary(lr_bestsubset2) 
+print("Drop high p-values")
+lr_bestsubset2 = dropHighPValues(lr_bestsubset2, lr_train_OS4)
+summary(lr_bestsubset2) 
+getAuc(observed, lr_bestsubset2$fitted.values)
+vif(lr_bestsubset2)
+
+# ==============================================================================
+# LASSO REGRESSION
+# ==============================================================================
+# LR Model 5
+set.seed(12345)
+y=lr_train_OS3$respondent
+x=model.matrix(respondent~.,lr_train_OS3)
+
+lassofit=glmnet(x, y, family="binomial", alpha=1,lambda=seq(0,0.1,0.001))
+lassocv=cv.glmnet(x,y,alpha=1,family="binomial", lambda=seq(0,0.1,0.001),nfold=3)
+lambdalasso=lassocv$lambda.min
+print(lambdalasso)
+plot(lassocv)
+dev.off()
+
+plot(lassofit,xvar="lambda",label=TRUE, main="Coeffs of Lasso Regression", type="l", 
+    xlab=expression("log_lambda"), ylab="Coeff")
+abline(h=0); abline(v=log(lassocv$lambda.min))
+dev.off()
+small.lambda.index <- which(lassocv$lambda == lassocv$lambda.min)
+small.lambda.betas <- coef(lassocv$glmnet.fit)[,small.lambda.index]
+lasso_names = names(small.lambda.betas[small.lambda.betas!=0])
+
+formul = as.formula(paste('respondent~', paste(lasso_names[-1], collapse=' + ')))
+lr_lasso1 = glm(formul, family="binomial", data = lr_train_OS3)
+summary(lr_lasso1)
+lr_lasso1 = dropHighPValues(lr_lasso1)
+summary(lr_lasso1)
+getAuc(observed, lr_lasso1$fitted.values)
+
+# LR Model 6
+set.seed(12345)
+y=lr_train_OS4$respondent
+x=model.matrix(respondent~.,lr_train_OS4)
+
+lassofit=glmnet(x, y, family="binomial", alpha=1,lambda=seq(0,0.1,0.001))
+lassocv=cv.glmnet(x,y,alpha=1,family="binomial", lambda=seq(0,0.1,0.001),nfold=3)
+lambdalasso=lassocv$lambda.min
+print(lambdalasso)
+plot(lassocv)
+dev.off()
+
+plot(lassofit,xvar="lambda",label=TRUE, main="Coeffs of Lasso Regression", type="l", 
+    xlab=expression("log_lambda"), ylab="Coeff")
+abline(h=0); abline(v=log(lassocv$lambda.min))
+dev.off()
+small.lambda.index <- which(lassocv$lambda == lassocv$lambda.min)
+small.lambda.betas <- coef(lassocv$glmnet.fit)[,small.lambda.index]
+lasso_names = names(small.lambda.betas[small.lambda.betas!=0])
+
+formul = as.formula(paste('respondent~', paste(lasso_names[-1], collapse=' + ')))
+lr_lasso2 = glm(formul, family="binomial", data = lr_train_OS4)
+summary(lr_lasso2)
+lr_lasso2 = dropHighPValues(lr_lasso2)
+summary(lr_lasso2)
+getAuc(observed, lr_lasso2$fitted.values)
+
+
+# ==============================================================================
+# OTHER SIMPLE LOGISTIC REGRESSIONS
+# ==============================================================================
+## Based on lr_bestsubset2 
+lr_model_simple1 <- glm(respondent ~ ordtyr + ordlyr + ord2ago + ord3ago + ordconsistency + falord + sprord, family="binomial", data = lr_train_OS4)
+summary(lr_model_simple1)
+getAuc(observed, lr_model_simple1$fitted.values)
+vif(lr_model_simple1)
+
+lr_model_simple2 <- glm(respondent ~ ordtyr + ordlyr + ord2ago + ord3ago + ordconsistency + slshist_log, family="binomial", data = lr_train_OS4)
+
+lr_model_simple3 <- glm(respondent ~ ordtyr + ordlyr + ord2ago + ord3ago + ordconsistency, family="binomial", data = lr_train_OS4)
+
+## Based on lr_bestsubset1 
+lr_model_simple4 <- glm(respondent ~ slsconsistency + slstyr_log + slslyr_log + sls2ago_log + sls3ago_log + falord + ordhist_new, family="binomial", data = lr_train_OS3)
+summary(lr_model_simple4)
+getAuc(observed, lr_model_simple4$fitted.values)
+vif(lr_model_simple4)
+
+# ==============================================================================
+# TEST USING TEST SET
+# ==============================================================================
+# Correct for oversampling
+q = nrow(lr_train_OS3[lr_train_OS3$targdol_bin==1,])/nrow(lr_train_OS3)
+
+getProbabilities <- function(fit_log_model, d){
+  probs_prime=predict(fit_log_model,newdata=data_test,type="response")
+  # change probabilities using the formula in the book
+  temp.prob = exp(log(probs_prime/(1-probs_prime)) - log(m*(1-q)/(1-m*q)))
+  d$probs=temp.prob/(temp.prob+1)
+  return(d)
+}
+
+
+# data_test$lr_probsstepwise1 = getProbabilities(lr_stepwise1, data_test)$probs
+data_test$lr_probsstepwise2 = getProbabilities(lr_stepwise2, data_test)$probs
+data_test$lr_probsbestsubset1 = getProbabilities(lr_bestsubset1, data_test)$probs
+data_test$lr_probsbestsubset2 = getProbabilities(lr_bestsubset2, data_test)$probs
+# data_test$lr_probslasso1 = getProbabilities(lr_lasso1, data_test)$probs
+# data_test$lr_probslasso2 = getProbabilities(lr_lasso2, data_test)$probs
+data_test$lr_probssimple1 = getProbabilities(lr_model_simple1, data_test)$probs
+# data_test$lr_probssimple2 = getProbabilities(lr_model_simple2, data_test)$probs
+# data_test$lr_probssimple3 = getProbabilities(lr_model_simple3, data_test)$probs
+data_test$lr_probssimple4 = getProbabilities(lr_model_simple4, data_test)$probs
+
+## Summarize models
+# summary(lr_stepwise1)
+# summary(lr_stepwise2)
+# summary(lr_bestsubset1)
+# summary(lr_bestsubset2)
+# summary(lr_lasso1)
+# summary(lr_lasso2)
+# summary(lr_model_simple1)
+# summary(lr_model_simple2)
+# summary(lr_model_simple3)
+# summary(lr_model_simple4)
+
+
+# ## Summarize results for all LR models
+# print("lr_stepwise1")
+# getAuc(observed, lr_stepwise1$fitted.values)
+# print("lr_stepwise2")
+# getAuc(observed, lr_stepwise2$fitted.values)
+# print("lr_bestsubset1")
+# getAuc(observed, lr_bestsubset1$fitted.values)
+# print("lr_bestsubset2")
+# getAuc(observed, lr_bestsubset2$fitted.values)
+# print("lr_lasso1")
+# getAuc(observed, lr_lasso1$fitted.values)
+# print("lr_lasso2")
+# getAuc(observed, lr_lasso2$fitted.values)
+# print("lr_simple1")
+# getAuc(observed, lr_model_simple1$fitted.values)
+# print("lr_simple2")
+# getAuc(observed, lr_model_simple2$fitted.values)
+# print("lr_simple3")
+# getAuc(observed, lr_model_simple3$fitted.values)
+# print("lr_simple4")
+# getAuc(observed, lr_model_simple4$fitted.values)
+
+# Calculate CCR for each model
+find_ccr <- function(p) {
+  tab <- table(data_test$targdol_bin, succ_probs > p)
+  CCR <- sum(diag(tab))/sum(tab)
+  return(CCR)
+}
+
+# # stepwise 1
+# max_CCR = 0
+# max_CCR_p = 0
+# succ_probs <- data_test$lr_probsstepwise1
+# pseq <-seq(0, 1, .01)
+# pseq_dat <- data.frame(pseq, sapply(pseq, find_ccr))
+# plot(pseq_dat, type = "l")
+# max_CCR_stepwise1 = max(pseq_dat[2])
+# pseq_max <- pseq_dat[pseq_dat[2] == max_CCR_stepwise1,]
+# optimal_p_stepwise1 = min(pseq_max[1])
+
+# stepwise 2
+max_CCR = 0
+max_CCR_p = 0
+succ_probs <- data_test$lr_probsstepwise2
+pseq <-seq(0, 1, .01)
+pseq_dat <- data.frame(pseq, sapply(pseq, find_ccr))
+plot(pseq_dat, type = "l")
+max_CCR_stepwise2 = max(pseq_dat[2])
+pseq_max <- pseq_dat[pseq_dat[2] == max_CCR_stepwise2,]
+optimal_p_stepwise2 = min(pseq_max[1])
+
+# best subset 1
+max_CCR = 0
+max_CCR_p = 0
+succ_probs <- data_test$lr_probsbestsubset1
+pseq <-seq(0, 1, .01)
+pseq_dat <- data.frame(pseq, sapply(pseq, find_ccr))
+plot(pseq_dat, type = "l")
+max_CCR_bestsubset1 = max(pseq_dat[2])
+pseq_max <- pseq_dat[pseq_dat[2] == max_CCR_bestsubset1,]
+optimal_p_bestsubset1 = min(pseq_max[1])
+
+# best subset 2
+max_CCR = 0
+max_CCR_p = 0
+succ_probs <- data_test$lr_probsbestsubset2
+pseq <-seq(0, 1, .01)
+pseq_dat <- data.frame(pseq, sapply(pseq, find_ccr))
+plot(pseq_dat, type = "l")
+max_CCR_bestsubset2 = max(pseq_dat[2])
+pseq_max <- pseq_dat[pseq_dat[2] == max_CCR_bestsubset2,]
+optimal_p_bestsubset2 = min(pseq_max[1])
+
+# # lasso 1
+# max_CCR = 0
+# max_CCR_p = 0
+# succ_probs <- data_test$lr_probslasso1
+# pseq <-seq(0, 1, .01)
+# pseq_dat <- data.frame(pseq, sapply(pseq, find_ccr))
+# plot(pseq_dat, type = "l")
+# max_CCR_lasso1 = max(pseq_dat[2])
+# pseq_max <- pseq_dat[pseq_dat[2] == max_CCR_lasso1,]
+# optimal_p_lasso1 = min(pseq_max[1])
+# 
+# # lasso 2
+# max_CCR = 0
+# max_CCR_p = 0
+# succ_probs <- data_test$lr_probslasso2
+# pseq <-seq(0, 1, .01)
+# pseq_dat <- data.frame(pseq, sapply(pseq, find_ccr))
+# plot(pseq_dat, type = "l")
+# max_CCR_lasso2 = max(pseq_dat[2])
+# pseq_max <- pseq_dat[pseq_dat[2] == max_CCR_lasso2,]
+# optimal_p_lasso2 = min(pseq_max[1])
+
+# simple 1
+max_CCR = 0
+max_CCR_p = 0
+succ_probs <- data_test$lr_probssimple1
+pseq <-seq(0, 1, .01)
+pseq_dat <- data.frame(pseq, sapply(pseq, find_ccr))
+plot(pseq_dat, type = "l")
+max_CCR_simple1 = max(pseq_dat[2])
+pseq_max <- pseq_dat[pseq_dat[2] == max_CCR_simple1,]
+optimal_p_simple1 = min(pseq_max[1])
+
+# simple 4
+max_CCR = 0
+max_CCR_p = 0
+succ_probs <- data_test$lr_probssimple4
+pseq <-seq(0, 1, .01)
+pseq_dat <- data.frame(pseq, sapply(pseq, find_ccr))
+plot(pseq_dat, type = "l")
+max_CCR_simple4 = max(pseq_dat[2])
+pseq_max <- pseq_dat[pseq_dat[2] == max_CCR_simple4,]
+optimal_p_simple4 = min(pseq_max[1])
+
+CCR_values <- data.frame(max_CCR_stepwise2, max_CCR_bestsubset1, max_CCR_bestsubset2, max_CCR_simple1, max_CCR_simple4)
+CCR_values
+optimal_p_values <- data.frame(optimal_p_stepwise2, optimal_p_bestsubset1, optimal_p_bestsubset2, optimal_p_simple1, optimal_p_simple4)
+optimal_p_values
+
+```
+
+
+## Data Visualizations for Multiple Regression
+```{r 5}
+## VISUALIZATIONS TO UNDERSTAND INTERACTIONS 
+plot(y = mr_train$targdol_log, 
+     x = mr_train$slstyr_log   )
+
+```
+
+
+
+## Multiple regression Model Selection
+```{r 6}
+### Define Functions
+mr_applyStep <- function(d){
+  print("--LM--")
+  fit_lm_mr = lm(targdol_log ~ ., data = d)
+  print(summary(fit_lm_mr))
+ 
+  # print("--Vif--")
+  # print(vif(fit_lm_mr))
+ 
+  #backward stepwise
+  print("--Stepwise regression--")
+  fit_step_mr = step(fit_lm_mr)
+  print(summary(fit_lm_mr))
+ 
+  #drop highest p_values
+  print("--removing non-significant--")
+  fit_dropped_mr = dropHighPValues(fit_step_mr, d)
+  print(summary(fit_dropped_mr))
+ 
+  #print("--Adj R2--")
+  #auc_value = getAuc(d$respondent, fit_glm$fitted.values)
+  #print(auc_value)
+  return(fit_dropped_mr)
+}
+
+mr_bestSubset <- function(d){
+  mr_fit_all = regsubsets(targdol_log ~ ., data = d, nbest=2)
+  mr_cp_values = summary(mr_fit_all)$cp
+  mr_best_one = which(mr_cp_values==min(mr_cp_values))
+  mr_temp_names = names(coef(mr_fit_all, mr_best_one))
+
+  formul = as.formula(paste('targdol_log~', paste(mr_temp_names[-1], collapse=' + ')))
+  mr_best_subset_fit = lm(formul, data = d)
+  return(mr_best_subset_fit)
+}
+
+
+
+### REFINE DATASET ###
+
+# Full dataset
+mr_train_1 <- mr_train
+
+# ROUND 1: Dataset without multicollinearities
+mr_train_2 <- subset(mr_train_1, select=-c(
+  slshist2yr_avg,
+  slshist3yr_avg,
+  slshist4yr_avg,
+  ordhist_new,
+  ordhist4yr, 
+  ordhist3yr, 
+  ordhist2yr,
+  ordhist4yr_avg, 
+  ordhist3yr_avg,
+  ordhist2yr_avg,
+  slsordhist,
+  slsordtyr,    
+  slsordlyr,
+  slsord2ago,
+  slsord3ago,
+  sls3ago_bin  #removed for multicollinearity
+  ))
+
+
+# ROUND 2: Dataset without multicollinearities - not really used, mostly for testing purposes
+mr_train_3 <- subset(mr_train_1, select=-c(
+ # slshist2yr_avg,
+#  slshist3yr_avg,
+ # slshist4yr_avg,
+  slshist2yr_log,
+  slshist3yr_log,
+  ordhist_new,
+  ordhist4yr, 
+  ordhist3yr, 
+  ordhist2yr,
+  ordhist4yr_avg, 
+  ordhist3yr_avg,
+  ordhist2yr_avg,
+  sls3ago_bin  #removed for multicollinearity with slsconsistency
+  ))
+
+# Check for correlations among the predictor variables
+corrplot(cor(mr_train_1), method="square")
+corrplot(cor(mr_train_2), method="square")
+corrplot(cor(mr_train_3), method="square")
+
+# Fit full model as reference for mr_train_2
+fullmodel <- lm(targdol_log ~ ., data = mr_train_2)
+summary(fullmodel)
+model_1 <- fullmodel
+
+# Fit full model as reference for mr_train_3
+fullmodel_3 <- lm(targdol_log ~ ., data = mr_train_3)
+summary(fullmodel_3)
+
+#Use regsubsets to get our first model
+
+mr_regsubsets10_all <- regsubsets(targdol_log ~ ., data = mr_train_2, nvmax = 20)
+mr_regsubsets10_all
+summary_mr_regsubsets10_all <- summary(mr_regsubsets10_all)
+
+plot((summary_mr_regsubsets10_all$bic))
+which.min(summary_mr_regsubsets10_all$bic)
+temp <- data.frame(summary_mr_regsubsets10_all$which[9,])
+temp$vars <- temp$summary_mr_regsubsets10_all.which.9...
+temp[temp$vars == TRUE,]
+
+# Define first real model (model_1 is full model)
+model_2 <- lm(targdol_log ~ 
+            #continuous vars
+              slstyr_log + 
+              slslyr_log + 
+              sls2ago_log + 
+              sls3ago_log + 
+              slshist_log +
+              slshist2yr_log +
+              slshist3yr_log +
+              
+            #consistency
+              slsconsistency +
+              
+            #orders
+              ord3ago
+              , 
+            data = mr_train_2)
+summary(model_2)
+# plot(model_2)
+
+## Model 3: Remove ord3ago, slshist2yr_log, and slshist3yr_log from model 2 for better interpretability (they also have the wrong sign)
+model_3 <- lm(targdol_log  ~ 
+             #continuous vars
+              slstyr_log + 
+              slslyr_log + 
+              sls2ago_log + 
+              sls3ago_log + 
+              slshist_log +
+              
+            #consistency
+              slsconsistency
+              , 
+            data = mr_train_2)
+summary(model_3)
+#plot(model_3)
+plot(model_3, which = 1)
+vif(model_3)
+
+model_4 <- lm(targdol_log  ~ 
+             #continuous vars
+              slstyr_log + 
+              slslyr_log + 
+              sls2ago_log + 
+              sls3ago_log + 
+              slshist_log +
+              
+            #consistency
+              factor(slsconsistency)
+              , 
+            data = mr_train_2)
+summary(model_4)
+plot(model_3,which=c(2))
+plot(model_4,which=c(2))
+
+# Check for influential obs - ultimately test dropping a few at end of code, but they do not have a large effect at all
+mse <- anova(model_3)['Residuals', 'Mean Sq']
+s <- sqrt(mse)
+resids <- model_3$residuals
+hdiag <- (lm.influence(model_3)$hat)
+isr <- resids / (s*sqrt(1-hdiag))
+n <- nobs(model_3)
+p <- 9
+conf = 0.10
+cooks <- (isr/(sqrt(p+1)))^2*(hdiag/(1-hdiag))
+levthres <- 0.015
+cooksthresh <- qf(p=conf,df1=p+1,df2=n-(p+1))
+print(output <- cbind(hdiag,cooks))
+print(output <- cbind(hdiag,cooks))
+print(evrule <- hdiag[hdiag > levthres])
+print(cooks[cooks>cooksthresh])
+
+## Model 5 - test out removing slsconsistency 
+## Conclusion - the predictions suffer, adjr2 is 0.06 instead of 0.13, so slsconsistency is useful
+## Also compare these predictions on the test data set and combined with logistic probabilities
+model_5 <- lm(targdol_log ~ 
+              slstyr_log + 
+              slslyr_log + 
+              sls2ago_log + 
+              sls3ago_log + 
+              slshist_log
+              , 
+            data = mr_train_2)
+summary(model_5)
+plot(model_5, which = 1)
+
+## Model 6 is Model 5 with  slshist4yr_log instead of slshist_log TO TEST RECENCY EFFECTS
+## Conclusion - this model is worse than model 4 which is worse than model 3. slshist_log (YTD sales) really helps with predictions, since has less correlation with prior years' sales volumes
+model_6 <- lm(targdol_log ~ 
+              slstyr_log + 
+              slslyr_log + 
+              sls2ago_log + 
+              sls3ago_log + 
+              slshist4yr_log
+              , 
+            data = mr_train_2)
+summary(model_6)
+# plot(model_6)
+
+## Fit model 7 - model 3 with slshist4yr added, even though it has multicollinearity 
+model_7 <- lm(targdol_log ~ 
+            #continuous vars
+              slstyr_log + 
+              slslyr_log + 
+              sls2ago_log + 
+              sls3ago_log + 
+              slshist4yr_log +
+              slshist_log +
+
+            #indicators
+              slsconsistency
+              , 
+            data = mr_train_2)
+summary(model_7)
+
+
+### Model 8 - slsconsistency variables removed again, more sales history added
+model_8 <- lm(targdol_log ~ 
+              slstyr_log + 
+              slslyr_log + 
+              sls2ago_log + 
+              sls3ago_log + 
+              slshist_log + 
+              slshist4yr_log + 
+              slshist2yr_log + 
+              slshist3yr_log 
+              , 
+            data = mr_train_2)
+summary(model_8)
+
+model_9 <- lm(targdol_log ~ 
+              slshist4yr_avg 
+           # + slshistyr_avg
+
+            #  + slstyr_log
+             # + slslyr_log
+             # + sls2ago_log
+            #  + sls3ago_log
+              , 
+            data = mr_train)
+summary(model_9)
+
+model_10 <- lm(targdol_log  ~ 
+             #continuous vars
+              slstyr_log + 
+              slslyr_log + 
+              sls2ago_log + 
+              sls3ago_log + 
+              slshist_log +
+              
+            #consistency
+              slsconsistency
+              , 
+            data = mr_train_2)
+summary(model_3)
+##############################
+##  Fit models using the mr_train_3 dataset
+##############################
+
+## Models start at 50
+
+## model 50 - full model using alternate set of predictor variables
+model_50 <- lm(targdol_log ~ ., data = mr_train_3)
+summary(model_50)
+                 
+## Model 51 - add in orders and sales per order and keep out indicators - still not as good as with indicators
+model_51 <- lm(targdol_log ~
+              slstyr_log +
+              slslyr_log +
+              sls2ago_log + 
+              sls3ago_log + 
+              ordtyr + 
+              ordlyr + 
+              ord2ago + 
+              ord3ago +
+              slsordhist +
+              slsordtyr + slsordlyr + slsord2ago + slsord3ago, 
+              data = mr_train_3)
+summary(model_51)
+plot(model_51)
+
+
+##############################
+## LASSO REGRESSION
+##############################
+
+## Define Model 60 using lasso
+
+## Conclusion: more complicated than model 2 and model 3, but with slightly higher adjusted r squared. Will have to see how it does on test data. Lean against using it. Shares many features with model 3.
+
+set.seed(12345)
+mr_y=mr_train_2$targdol_log
+mr_x=model.matrix(targdol_log~.,mr_train_2)
+
+mr_lassofit=glmnet(mr_x, mr_y, family="gaussian", alpha=1,lambda=seq(0,0.1,0.001))
+mr_lassocv=cv.glmnet(mr_x,mr_y,alpha=1,family="gaussian", lambda=seq(0,0.1,0.001),nfold=3)
+mr_lambdalasso=mr_lassocv$lambda.min
+print(mr_lambdalasso)
+plot(mr_lassocv)
+
+plot(mr_lassofit,xvar="lambda",label=TRUE, main="Coeffs of Lasso Regression", type="l", 
+    xlab=expression("log_lambda"), ylab="Coeff")
+abline(h=0); abline(v=log(mr_lassocv$lambda.min))
+mr_small.lambda.index <- which(mr_lassocv$lambda == mr_lassocv$lambda.min)
+mr_larger.lambda.index <- which(mr_lassocv$lambda == .01)
+mr_small.lambda.betas <- coef(mr_lassocv$glmnet.fit)[,mr_small.lambda.index]
+mr_larger.lambda.betas <- coef(mr_lassocv$glmnet.fit)[,mr_larger.lambda.index]
+mr_lasso_names = names(mr_small.lambda.betas[mr_small.lambda.betas!=0])
+mr_lasso_names_larger = names(mr_larger.lambda.betas[mr_larger.lambda.betas!=0])
+
+mr_formul = as.formula(paste('targdol_log~', paste(mr_lasso_names[-1], collapse=' + ')))
+mr_fit_lasso = lm(mr_formul, family="gaussian", data = mr_train_2) ##MN: corrected on 11-29
+summary(mr_fit_lasso)
+mr_fit_lasso = dropHighPValues(mr_fit_lasso)
+
+summary(mr_fit_lasso)
+
+model_60 <- mr_fit_lasso
+vif(model_60)
+#mr_fit_lasso_mod <- lm(
+#  slstyr_log + slslyr_log + ordlyr + ord2ago + ord3ago
+#)
+
+# Fewer predictor variables
+mr_formul_larger = as.formula(paste('targdol_log~', paste(mr_lasso_names_larger[-1], collapse=' + ')))
+mr_fit_lasso_larger = lm(mr_formul_larger, family="gaussian", data = mr_train_2) ##MN: corrected on 11-29
+summary(mr_fit_lasso_larger)
+mr_fit_lasso_larger = dropHighPValues(mr_fit_lasso_larger)
+
+summary(mr_fit_lasso_larger)
+
+model_61 <- mr_fit_lasso_larger
+vif(model_61)
+
+
+mr_fit_lasso_larger_v2 <- lm(targdol_log ~
+                  slsconsistency +
+                  slstyr_log +
+                    slslyr_log +
+                    sls2ago_log +
+                    sls3ago_log + 
+                    slshist_log + 
+#                    slstyr_bin + 
+                    ord2ago +
+                    ord3ago
+                  ,
+                  data = mr_train_2)
+model_62 <- mr_fit_lasso_larger_v2
+summary(model_62)
+vif(model_62)
+vif(model_2)
+
+
+# ==============================================================================
+# STEPWISE REGRESSION
+# ==============================================================================
+
+## Define models 20 and 21 using stepwise created by Neelam
+
+## Less interpretable than other models but have high adjusted rsquareds
+
+# Model 20
+# Turns out to be the exact same as LASSO
+mr_fit_log_2 <- mr_applyStep(mr_train_2)
+names_20 = names(coef(mr_fit_log_2))
+names_20
+formul_20 = as.formula(paste('targdol_log~', paste(names_20[-1], collapse=' + ')))
+formul_20
+lm(formul_20, data = mr_train_2)
+model_20 <- lm(formul_20, data = mr_train_2)
+summary(model_20)
+
+# Model 21
+mr_fit_log_3 <- mr_applyStep(mr_train_3)
+names_3 = names(coef(mr_fit_log_3))
+names_3
+formul_3 = as.formula(paste('targdol_log~', paste(names_3[-1], collapse=' + ')))
+formul_3
+lm(formul_3, data = mr_train_3)
+model_21 <- lm(formul_3, data = mr_train_3)
+summary(model_21)
+plot(model_21)
+
+######################################################
+#### EVALUATE MODELS USING MSE and ADJR2
+######################################################
+
+results_rows = 15
+n = nrow(mr_test)
+
+adjr2 <- rep(0,results_rows)
+mse <- rep(0,results_rows)
+mse_nolog <- rep(0,results_rows)
+mr_test_results = data.frame(adjr2, mse)
+mr_test_results
+
+mylist <- list()
+mylist[[1]] <- model_1 #full model
+mylist[[2]] <- model_2 #base case
+mylist[[3]] <- model_3
+mylist[[4]] <- model_4
+mylist[[5]] <- model_5
+mylist[[6]] <- model_6
+mylist[[7]] <- model_7
+mylist[[8]] <- model_8
+mylist[[9]] <- model_9  #test out model that uses 4 year average
+mylist[[10]] <- model_21 #stepwise
+mylist[[11]] <- model_60 #lasso
+mylist[[12]] <- model_50 #different predictors
+mylist[[13]] <- model_51
+mylist[[14]] <- model_61
+mylist[[15]] <- model_62
+
+for (i in 1:results_rows){
+#  print(i)
+#  print(vif(mylist[[i]]))
+  mr_test_results$mse[i] <- sum((predict(mylist[[i]], newdata = mr_test) - mr_test$targdol_log)^2)/ n
+  
+  mr_test_results$adjr2[i] <- summary(mylist[[i]])$adj.r.squared
+
+  mr_test_results$mse_nolog[i] <- sum((
+   exp(predict(mylist[[i]], newdata = mr_test)) - exp(mr_test$targdol_log))^2)/ n
+  
+}
+
+mr_test_results
+
+plot(mr_test_results$mse, xlab = "Model Number", ylab = "Mean Squared Error")
+#plot(mr_test_results$adjr2, xlab = "Model Number", ylab = "Adj R2")
+
+
+###### ADD NAMES OF MODELS HERE IF YOU WANT TO INCLUDE IN VALIDATION
+## Calculate predicted values
+data_test$mr_predmodel3 <- predict(model_3, newdata = data_test) # model 3
+data_test$mr_predmodel15 <- predict(model_62, newdata = data_test) # model 15
+
+```
+
+## Model Validation
+```{r 7}
+# function that calculates expected revenue (i.e., predicted targdol) by multiplying the MR model predicted values * LR model predicted probabilities, then undoing the log calculation
+getExpectedValues <- function(mr_fitted, lr_fitted){
+  fitted_targdol = exp(mr_fitted * lr_fitted) - 1
+  return(fitted_targdol)
+}
+
+# function that gives the top 10 customers that you should market to to get max revenue
+findTopCustomers <- function(columnName, numberCustomer){
+    topPred <- data_test[orderv(data_test[columnName], decreasing=TRUE),][1:numberCustomer,]
+    indices_top_pred <- as.numeric(row.names(topPred))
+    top_customers <- indices_top_pred
+  return(top_customers)
+}
+
+# function that gives how much overlap we have in the predicted top customers vs the actual top customers (i.e. did we correctly identify the top 1000 customers using our model?)
+findTopOverlap <- function(columnName, numberCustomer){
+    topPred <- data_test[orderv(data_test[columnName], decreasing=TRUE),][1:numberCustomer,]
+    topAct <- data_test[order(data_test$targdol, decreasing=TRUE),][1:numberCustomer,]
+    
+    indices_top_pred <- as.numeric(row.names(topPred))
+    indices_top_act <- as.numeric(row.names(topAct))
+    overlap_amount <- length(intersect(indices_top_act, indices_top_pred))
+    
+    overlap_ratio <-  overlap_amount / numberCustomer
+  return(overlap_ratio)
+}
+
+# function that calculates the sum of the predicted top customers' revenue
+findTopCoverage <- function(columnName, numberCustomer){
+    topPred <- data_test[orderv(data_test[columnName], decreasing=TRUE),][1:numberCustomer,]
+    indices_top_pred <- as.numeric(row.names(topPred))
+    
+    total_predicted <- sum(data_test$targdol[indices_top_pred], na.rm=TRUE)
+  return(total_predicted)
+}
+
+actual_targdol_log = data_test$targdol_log
+SST = sum((actual_targdol_log - mean(actual_targdol_log))^2)
+
+columnn_names = c()
+top_customers_target = c()
+overlap_1000 = c()
+coverage_1000 = c()
+predicted_sum_1000 = c()
+actual_sum_1000 = c()
+sse_values = c()
+mse_values = c()
+
+
+###### ADD NAMES OF ANY ADDITIONAL MULTIPLE REGRESSION MODELS YOU WANT TO VALIDATE FOR HERE
+for (mr_fit in c('mr_predmodel3', 'mr_predmodel15')) {
+  mr_fitted_vals = data_test[mr_fit]
+  
+  for (lr_fit in c('lr_probsstepwise2', 'lr_probsbestsubset1', 'lr_probsbestsubset2', 'lr_probssimple1', 'lr_probssimple4')) {
+    new_column = paste(mr_fit, '&', lr_fit)
+    fitted_log_vals = data_test[lr_fit]
+    resid_column = paste(mr_fit, '&', lr_fit, "res")
+    
+    predicted_expectations = getExpectedValues(mr_fitted_vals, fitted_log_vals) # calculate the predicted targdol
+    
+    predicted_targdol_log = mr_fitted_vals * fitted_log_vals # calculate the predicted targdol_log
+    SSE = sum((predicted_targdol_log - actual_targdol_log)^2) # SSE of predicted targdol_log
+    sse_values = rbind(sse_values, SSE)
+    MSE = sum((predicted_targdol_log - actual_targdol_log)^2) / nrow(data_test) # MSE of predicted targdol_log
+    mse_values = rbind(mse_values, MSE)
+    Resids = data_test$targdol_log - predicted_targdol_log
+
+    data_test[resid_column] = Resids
+    
+    data_test[new_column] = predicted_expectations # create new column in data_test corresponding to the predicted targdol for the specified model combo
+    top_customers = findTopCustomers(new_column, 10) # identify the top 10 customers
+    overlap_ratio_1000 = findTopOverlap(new_column, 1000) # overlap in top customers predicted vs. actual
+    top_predicted_amount_1000 = findTopCoverage(new_column, 1000) # top predicted targdol amounts
+    top_actual_amount_1000 = findTopCoverage('targdol', 1000) # top actual targdol amounts
+    
+    # record values
+    columnn_names = rbind(columnn_names, new_column)
+    top_customers_target = rbind(top_customers_target, top_customers)
+    overlap_1000 = rbind(overlap_1000, overlap_ratio_1000)
+    predicted_sum_1000 = rbind(predicted_sum_1000, top_predicted_amount_1000)
+    actual_sum_1000 = rbind(actual_sum_1000, top_actual_amount_1000)
+
+  } 
+}
+
+coverage_1000 = predicted_sum_1000/actual_sum_1000
+r_squared = 1 - sse_values/SST # r_squared of predicted targdol_log
+
+results = data.frame(columnn_names, sse_values, mse_values, r_squared, overlap_1000, predicted_sum_1000, actual_sum_1000, coverage_1000, top_customers_target)
+results
+
+# Plot residuals 
+par(mfrow=c(3,4))
+plot(data_test$targdol_log, data_test$"mr_predmodel15 & lr_probsstepwise2 res")
+plot(data_test$targdol_log, data_test$"mr_predmodel15 & lr_probsbestsubset1 res")
+plot(data_test$targdol_log, data_test$"mr_predmodel15 & lr_probsbestsubset2 res")
+plot(data_test$targdol_log, data_test$"mr_predmodel15 & lr_probssimple1 res")
+plot(data_test$targdol_log, data_test$"mr_predmodel15 & lr_probssimple4 res")
+plot(data_test$targdol_log, data_test$"mr_predmodel3 & lr_probsstepwise2 res")
+plot(data_test$targdol_log, data_test$"mr_predmodel3 & lr_probsbestsubset1 res")
+plot(data_test$targdol_log, data_test$"mr_predmodel3 & lr_probsbestsubset2 res")
+plot(data_test$targdol_log, data_test$"mr_predmodel3 & lr_probssimple1 res")
+plot(data_test$targdol_log, data_test$"mr_predmodel3 & lr_probssimple4 res")
+
+
+
+
+
+
+### NOTE: In the report, the model names are:
+## LOGISTIC MODELS:
+# lr_stepwise2 = lr_model1
+# lr_bestsubset1 = lr_model2
+# lr_bestsubset2 = lr_model3
+# lr_simple1 = lr_model4
+# lr_simple4 = lr_model5
+## MULTIPLE REGRESSION MODELS:
+# mr_model3 = mr_model2
+# mr_model15 = mr_model1
+
+```
+
+## Graphics for Report
+```{r}
+# Predicted vs Actual Plot for Model 3
+ plot(predict(model_3),mr_train_2$targdol_log,
+      xlab="predicted",ylab="actual", xlim = c(0, 8), ylim = c(0, 8))
+ abline(a=0,b=1)
+
+ plot(predict(model_60),mr_train_2$targdol_log,
+      xlab="predicted",ylab="actual", xlim = c(0, 8), ylim = c(0, 8))
+ abline(a=0,b=1)
+```
+
+
+## Various Logistic Regression Figures/Tables 
+```{r}
+summary(lr_stepwise2)
+summary(lr_bestsubset1)
+summary(lr_bestsubset2)
+summary(lr_model_simple1)
+summary(lr_model_simple4)
+
+
+
+```
+
+
+## Various Multiple Regression Plots
+```{r}
+
+summary(model_3)
+
+buyer1 <- data.frame(NA, log(40+1), log(40+1), log(40+1), log(40+1), log(160+1), 4)
+colnames(buyer1) <- c("targdol_log", "slstyr_log", "slslyr_log", "sls2ago_log", "sls3ago_log", "slshist_log", "slsconsistency")
+exp(predict(model_3, newdata = buyer1))
+
+buyer2 <- data.frame(NA, log(0+1), log(0+1), log(0+1), log(0+1), log(0+1), 0)
+colnames(buyer2) <- c("targdol_log", "slstyr_log", "slslyr_log", "sls2ago_log", "sls3ago_log", "slshist_log", "slsconsistency")
+exp(predict(model_3, newdata = buyer2))
+
+
+#buyer3 <- data.frame(NA, log(100+1), log(100+1), log(100+1), log(80+1), log(320+1), 4)
+#colnames(buyer3) <- c("targdol_log", "slstyr_log", "slslyr_log", "sls2ago_log", "sls3ago_log", "slshist_log", "slsconsistency")
+#exp(predict(model_3, newdata = buyer3))
+
+jpeg('mr_plot1.jpg')
+layout(matrix(c(1,2),1,2, byrow=TRUE))
+plot((summary_mr_regsubsets10_all$adjr2), xlab = "# of Predictors", ylab = "Adjusted R-Squared", main = "Adjusted R-Squared", ylim = c(0,.16))
+plot((summary_mr_regsubsets10_all$bic), xlab = "# of Predictors", ylab = "Bayes Information Criteria", main = "Bayes Information Criteria")
+dev.off()
+
+layout(matrix(c(1,1),1,1, byrow=TRUE))
+jpeg('mr_plot2.jpg')
+plot(mr_lassocv)
+dev.off()
+
+layout(matrix(c(1,1),1,1, byrow=TRUE))
+jpeg('mr_plot3.jpg')
+plot(model_3, which = 2)
+dev.off()
+
+layout(matrix(c(1,1),1,1, byrow=TRUE))
+jpeg('mr_plot4.jpg')
+plot(model_3, which = 1)
+dev.off()
+
+layout(matrix(c(1,1),1,1, byrow=TRUE))
+jpeg('mr_plot5.jpg')
+plot(model_3_exp, which = 1)
+dev.off()
+
+layout(matrix(c(1,1),1,1, byrow=TRUE))
+jpeg('mr_plot6.jpg')
+plot(model_3, which = 6)
+dev.off()
+
+
+
+summary(model_2)
+summary(model_3)
+summary(model_60)
+
+summary(model_2)$coefficients
+summary(model_3)$coefficients
+summary(model_60)$coefficients
+
+#plot(y = model_3$fitted, mr_train_2$targdol_log, xlab = "Actual", ylab = "Fitted", xlim = c(1,6), ylim = c(1,6) )
+#abline(a = 0, b = 1)
